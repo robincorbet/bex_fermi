@@ -490,6 +490,71 @@ class BexFermi:
             sys.exit(1)
         
         self.logger.info("Environment check passed")
+        
+        # Create unique PFILES directory to avoid collisions
+        # This is critical for running multiple instances simultaneously
+        self._setup_pfiles()
+    
+    def _setup_pfiles(self):
+        """
+        Create a unique PFILES directory for this process.
+        This prevents parameter file collisions when running multiple instances.
+        Based on the Perl script's approach.
+        """
+        # Create unique pfiles directory in /tmp based on PID
+        pid = os.getpid()
+        self.pfiles_tmp = f"/tmp/pfiles_bex_{pid}.tmp"
+        
+        try:
+            os.makedirs(self.pfiles_tmp, exist_ok=True)
+            self.logger.info(f"Created PFILES directory: {self.pfiles_tmp}")
+            
+            # Get original PFILES path
+            original_pfiles = os.environ.get('PFILES', '')
+            
+            # Copy parameter files from FERMI_DIR and HEADAS
+            fermi_dir = os.environ.get('FERMI_DIR', '')
+            headas = os.environ.get('HEADAS', '')
+            
+            if fermi_dir:
+                syspfiles = os.path.join(fermi_dir, 'syspfiles')
+                if os.path.exists(syspfiles):
+                    subprocess.run(
+                        f'cp {syspfiles}/*.par {self.pfiles_tmp}/.',
+                        shell=True,
+                        check=False  # Don't fail if no .par files
+                    )
+            
+            if headas:
+                syspfiles = os.path.join(headas, 'syspfiles')
+                if os.path.exists(syspfiles):
+                    subprocess.run(
+                        f'cp {syspfiles}/f*.par {self.pfiles_tmp}/.',
+                        shell=True,
+                        check=False
+                    )
+            
+            # Set PFILES to use our directory first, then system defaults
+            new_pfiles = f"{self.pfiles_tmp}"
+            if original_pfiles:
+                # Add original PFILES as fallback (separated by :)
+                new_pfiles += f":{original_pfiles}"
+            
+            os.environ['PFILES'] = new_pfiles
+            self.logger.info(f"Set PFILES={new_pfiles}")
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to set up PFILES directory: {e}")
+            # Continue anyway - it might still work
+    
+    def _cleanup_pfiles(self):
+        """Clean up the temporary PFILES directory."""
+        if hasattr(self, 'pfiles_tmp') and os.path.exists(self.pfiles_tmp):
+            try:
+                shutil.rmtree(self.pfiles_tmp)
+                self.logger.info(f"Cleaned up PFILES directory: {self.pfiles_tmp}")
+            except Exception as e:
+                self.logger.warning(f"Failed to clean up PFILES directory: {e}")
     
     def get_value(self, prompt, default, minimum, maximum):
         """
@@ -647,6 +712,7 @@ class BexFermi:
         """
         Interactively prompt for all analysis parameters.
         This mimics the original Perl script's behavior.
+        Uses current instance values as defaults (which may have been loaded from a parameter file).
         """
         print("\n" + "="*60)
         print("BEX FERMI - Parameter Setup")
@@ -655,7 +721,7 @@ class BexFermi:
         # Bin size
         self.bin_size = self.get_value(
             "Give bin size (seconds, or -ve for days!)",
-            DEFAULT_BIN_SIZE, -1e10, 1e10
+            self.bin_size, -1e10, 1e10
         )
         if self.bin_size < 0:
             self.bin_size = -self.bin_size * 86400.0
@@ -664,18 +730,18 @@ class BexFermi:
         # Energy range
         self.emin = self.get_value(
             "Give Emin (MeV)",
-            DEFAULT_EMIN, 0, 1e10
+            self.emin, 0, 1e10
         )
         
         self.emax = self.get_value(
             "Give Emax (MeV)",
-            DEFAULT_EMAX, self.emin, 1e10
+            self.emax, self.emin, 1e10
         )
         
         # Probability photometry
         self.use_probability = self.get_yn(
             "Use probability photometry?",
-            DEFAULT_USE_PROBABILITY
+            self.use_probability
         )
         
         if self.use_probability:
@@ -687,7 +753,7 @@ class BexFermi:
             
             self.catalog = self.get_string(
                 "Give source catalog file name",
-                DEFAULT_CATALOG
+                self.catalog
             )
             print(f"catalog = {self.catalog}\n")
         else:
@@ -697,13 +763,13 @@ class BexFermi:
         # Prefix
         self.prefix = self.get_string(
             "Give any prefix for output file name(s) [optional]",
-            DEFAULT_PREFIX
+            self.prefix
         )
         
         # Diffuse response
         self.dodiffuse = self.get_yn(
             "Calculate diffuse response?",
-            DEFAULT_DODIFFUSE
+            self.dodiffuse
         )
         
         if self.dodiffuse:
@@ -725,13 +791,13 @@ class BexFermi:
         
         self.irf_code = self.get_value(
             "Which IRFs?",
-            DEFAULT_IRF_CODE, 1, 9
+            self.irf_code, 1, 9
         )
         
         # Barycenter
         self.barycenter = self.get_yn(
             "Barycenter light curves?",
-            DEFAULT_BARYCENTER
+            self.barycenter
         )
         
         if self.barycenter:
@@ -742,13 +808,13 @@ class BexFermi:
         # Source list file
         self.source_list = self.get_file(
             "Give source parameter file",
-            DEFAULT_SOURCE_LIST
+            self.source_list
         )
         
         # Photon file list
         self.ft1_list = self.get_file(
             "Give photon file name list",
-            DEFAULT_FT1_LIST
+            self.ft1_list
         )
         
         # Spacecraft file
@@ -758,7 +824,7 @@ class BexFermi:
             default_ft2 = str(sc_files[0])
             print(f"Number of SC files found = 1")
         else:
-            default_ft2 = DEFAULT_FT2
+            default_ft2 = self.ft2
             if sc_files:
                 print(f"Number of SC files found = {len(sc_files)}")
         
@@ -782,31 +848,31 @@ class BexFermi:
         if self.use_probability:
             self.pthreshold = self.get_value(
                 "Give probability minimum to use",
-                DEFAULT_PTHRESHOLD, 0, 1
+                self.pthreshold, 0, 1
             )
         
         # Zenith limit
         self.zenith_limit = self.get_value(
             "Give Zenith limit (degrees)",
-            DEFAULT_ZENITH_LIMIT, 0, 'INDEF'
+            self.zenith_limit, 0, 'INDEF'
         )
         
         # Rock angle
         self.rock = self.get_value(
             "Give rock angle limit (degrees)",
-            DEFAULT_ROCK, -90, 90
+            self.rock, -90, 90
         )
         
         # Bore limit
         self.bore = self.get_value(
             "Give Bore limit (degrees)",
-            DEFAULT_BORE, 0, 360
+            self.bore, 0, 360
         )
         
         # Spectral index
         self.spectral_index = self.get_value(
             "Give spectral index",
-            DEFAULT_SPECTRAL_INDEX, -100, 100
+            self.spectral_index, -100, 100
         )
         
         if self.spectral_index > 0:
@@ -817,7 +883,7 @@ class BexFermi:
         # Sun minimum
         self.sun_minimum = self.get_value(
             "Give minimum solar distance (degrees)",
-            DEFAULT_SUN_MINIMUM, 0, 180
+            self.sun_minimum, 0, 180
         )
         
         print("\n" + "="*60)
@@ -828,29 +894,34 @@ class BexFermi:
         """Main processing loop for all sources in the source list."""
         self.logger.info(f"Processing sources from: {self.source_list}")
         
-        # Read source list
-        sources = []
-        with open(self.source_list, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    sources.append(line.split())
-        
-        self.logger.info(f"Found {len(sources)} sources to process")
-        
-        # Process each source
-        for source_info in sources:
-            source_name = source_info[0]
-            self.logger.info(f"\n{'='*60}")
-            self.logger.info(f"Processing source: {source_name}")
-            self.logger.info(f"{'='*60}")
+        try:
+            # Read source list
+            sources = []
+            with open(self.source_list, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        sources.append(line.split())
             
-            try:
-                self.process_single_source(source_name, source_info)
-            except Exception as e:
-                self.logger.error(f"Error processing {source_name}: {e}")
-                if self.debug_mode:
-                    raise
+            self.logger.info(f"Found {len(sources)} sources to process")
+            
+            # Process each source
+            for source_info in sources:
+                source_name = source_info[0]
+                self.logger.info(f"\n{'='*60}")
+                self.logger.info(f"Processing source: {source_name}")
+                self.logger.info(f"{'='*60}")
+                
+                try:
+                    self.process_single_source(source_name, source_info)
+                except Exception as e:
+                    self.logger.error(f"Error processing {source_name}: {e}")
+                    if self.debug_mode:
+                        raise
+        
+        finally:
+            # Clean up PFILES directory
+            self._cleanup_pfiles()
     
     def process_single_source(self, source_name, source_info):
         """
@@ -1579,13 +1650,17 @@ Output format:
     processor.check_environment()
     
     # Read parameters from file if specified
+    # This sets the defaults, but doesn't prevent prompting unless -batch is used
     if args.file:
         processor.read_parameter_file(args.file)
+        processor.logger.info(f"Read defaults from parameter file: {args.file}")
     
-    # In interactive mode (not batch and no file), prompt for parameters
-    if not args.batch and not args.file:
+    # In interactive mode (not batch), prompt for parameters
+    # The prompts will use values from parameter file as defaults if -file was used
+    if not args.batch:
         processor.prompt_for_parameters()
-    elif args.batch and not args.file:
+    elif not args.file:
+        # Batch mode requires a parameter file
         print("\nError: Batch mode requires -file parameter")
         print("Use -file <parfile> to specify parameter file")
         print("Or run without -batch for interactive mode")
