@@ -1,0 +1,45 @@
+# BEX_FERMI parameter file example
+# Lines starting with # are comments
+#
+# Format: parameter_name value
+# 
+
+# Time binning
+bin_size 500
+
+# Energy range (MeV)
+emin 100
+emax 500000
+
+# Probability photometry
+use_probability true
+catalog gll_psc_v40.fit
+pthreshold 0.0
+
+# Region of interest (degrees)
+roi 3
+roi_probability 3
+
+# Selection criteria (degrees)
+zenith_limit 105
+rock 90
+bore 180
+event_class_min 3
+sun_minimum 5.0
+
+# IRF and spectral model
+# IRF codes: 1=P6_V3, 2=P6_V11, 3=P7_V6, 4=P7REP, 5=P7REP/newbackground,
+#            6=P8, 7=P8R3_new_iso, 8=4FGL, 9=v2.0 (recommended)
+irf_code 9
+spectral_index -2.1
+
+# Barycenter correction
+barycenter true
+
+# Input files
+source_list slist.dat
+ft1_list plist.dat
+ft2 lat_spacecraft_merged.fits
+
+# Output prefix (optional, can be empty)
+prefix 

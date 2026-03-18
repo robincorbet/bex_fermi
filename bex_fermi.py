@@ -16,6 +16,7 @@ Date: 2026-02-09
 
 import os
 import sys
+import re
 import argparse
 import subprocess
 import tempfile
@@ -27,7 +28,7 @@ from astropy.time import Time
 import logging
 
 # Constants
-VERSION = "2.0"
+VERSION = "2.1"
 MJDREF = 51910.0 + 7.428703703703703e-4
 FERMI_MET_ORIGIN = 51910.0  # MJD for 2001-01-01 00:00:00 TT
 
@@ -41,7 +42,7 @@ DEFAULT_BORE = 180
 DEFAULT_EVENT_CLASS_MIN = 3
 DEFAULT_SOURCE_LIST = "slist.dat"
 DEFAULT_FT1_LIST = "plist.dat"
-DEFAULT_CATALOG = "gll_psc_v35.fit"
+DEFAULT_CATALOG = "gll_psc_v40.fit"
 DEFAULT_PTHRESHOLD = 0.0
 DEFAULT_FT2 = "lat_spacecraft_merged.fits"
 DEFAULT_IRF_CODE = 9
@@ -178,19 +179,44 @@ class BexFermi:
             rate = np.zeros(nlc_bins, dtype=np.float32)
             total_sum = 0.0
             
-            # Cycle through photons calculating new light curve
-            for i in range(nphotons):
-                # Get time bin for this photon
-                timebin = self._get_timebin(ph_time[i], lc_time, nlc_bins, 
-                                           tstart, hbs, binsize)
-                
-                # Check if photon is in valid time bin and GTI
-                if (0 <= timebin < nlc_bins and 
-                    self._check_gti(gti_start, gti_stop, ph_time[i], ngtis)):
-                    
-                    if probability[i] > threshold:
-                        rate[timebin] += probability[i]
-                        total_sum += probability[i]
+            # Vectorized approach for much better performance
+            self.logger.info(f"Processing {nphotons} photons with vectorized algorithm...")
+            
+            # Filter photons by threshold first (if applicable)
+            if threshold > 0:
+                valid_mask = probability > threshold
+                valid_probs = probability[valid_mask]
+                valid_times = ph_time[valid_mask]
+                self.logger.info(f"After threshold filter: {len(valid_probs)} photons")
+            else:
+                valid_probs = probability
+                valid_times = ph_time
+            
+            # For each photon, find its time bin
+            # Vectorized calculation of approximate bin numbers
+            approx_bins = np.floor((valid_times - tstart) / binsize).astype(int) - 10
+            approx_bins = np.maximum(approx_bins, 0)
+            
+            # Check GTIs - vectorized
+            in_gti = np.zeros(len(valid_times), dtype=bool)
+            for i in range(ngtis):
+                in_gti |= (valid_times >= gti_start[i]) & (valid_times <= gti_stop[i])
+            
+            valid_probs = valid_probs[in_gti]
+            valid_times = valid_times[in_gti]
+            approx_bins = approx_bins[in_gti]
+            
+            self.logger.info(f"After GTI filter: {len(valid_probs)} photons")
+            
+            # Now find exact bins for each photon
+            # This is still a loop but much smaller dataset after filtering
+            for i in range(len(valid_times)):
+                # Start search from approximate bin
+                for j in range(approx_bins[i], nlc_bins):
+                    if (lc_time[j] - hbs) <= valid_times[i] <= (lc_time[j] + hbs):
+                        rate[j] += valid_probs[i]
+                        total_sum += valid_probs[i]
+                        break
             
             self.logger.info(f"Probability sum: {total_sum}")
             
@@ -718,6 +744,9 @@ class BexFermi:
         print("BEX FERMI - Parameter Setup")
         print("="*60 + "\n")
         
+        # Store current working directory for relative paths
+        self.cwd = os.getcwd()
+        
         # Bin size
         self.bin_size = self.get_value(
             "Give bin size (seconds, or -ve for days!)",
@@ -762,7 +791,7 @@ class BexFermi:
         
         # Prefix
         self.prefix = self.get_string(
-            "Give any prefix for output file name(s) [optional]",
+            "Give any prefix for output file name(s)",
             self.prefix
         )
         
@@ -894,6 +923,26 @@ class BexFermi:
         """Main processing loop for all sources in the source list."""
         self.logger.info(f"Processing sources from: {self.source_list}")
         
+        # Convert file paths to absolute paths
+        # This prevents issues when we change directories or set PFILES
+        # NOTE: Don't convert catalog here - we need to check multiple locations for it
+        if not os.path.isabs(self.source_list):
+            self.source_list = os.path.abspath(self.source_list)
+        if not os.path.isabs(self.ft1_list):
+            self.ft1_list = os.path.abspath(self.ft1_list)
+        if not os.path.isabs(self.ft2):
+            self.ft2 = os.path.abspath(self.ft2)
+        
+        # Validate that all required files exist before processing
+        self._validate_input_files()
+        
+        self.logger.info(f"Absolute paths:")
+        self.logger.info(f"  Source list: {self.source_list}")
+        self.logger.info(f"  FT1 list: {self.ft1_list}")
+        self.logger.info(f"  FT2 file: {self.ft2}")
+        if hasattr(self, 'catalog'):
+            self.logger.info(f"  Catalog: {self.catalog}")
+        
         try:
             # Read source list
             sources = []
@@ -922,6 +971,104 @@ class BexFermi:
         finally:
             # Clean up PFILES directory
             self._cleanup_pfiles()
+    
+    def _validate_input_files(self):
+        """
+        Validate that all required input files exist before processing.
+        Provides clear error messages if files are missing.
+        """
+        missing_files = []
+        
+        # Check source list
+        if not os.path.exists(self.source_list):
+            missing_files.append(f"Source list: {self.source_list}")
+        
+        # Check FT1 list
+        if not os.path.exists(self.ft1_list):
+            missing_files.append(f"Photon file list: {self.ft1_list}")
+        else:
+            # Check that files in the FT1 list exist
+            with open(self.ft1_list, 'r') as f:
+                for i, line in enumerate(f, 1):
+                    ft1_file = line.strip()
+                    if ft1_file and not ft1_file.startswith('#'):
+                        if not os.path.exists(ft1_file):
+                            missing_files.append(f"Photon file (line {i} of {self.ft1_list}): {ft1_file}")
+        
+        # Check FT2 spacecraft file
+        if not os.path.exists(self.ft2):
+            missing_files.append(f"Spacecraft file: {self.ft2}")
+        
+        # Check catalog if using probability photometry
+        if self.use_probability and hasattr(self, 'catalog'):
+            # Catalog might be in multiple locations, so check all possibilities
+            catalog_found = False
+            catalog_paths_checked = []
+            
+            # First check if it's an absolute path and exists
+            if os.path.isabs(self.catalog):
+                catalog_paths_checked.append(self.catalog)
+                if os.path.exists(self.catalog):
+                    catalog_found = True
+            else:
+                # Relative path - check multiple locations
+                # 1. Current directory
+                if os.path.exists(self.catalog):
+                    catalog_found = True
+                    catalog_paths_checked.append(os.path.abspath(self.catalog))
+                else:
+                    catalog_paths_checked.append(os.path.abspath(self.catalog))
+                    
+                    # 2. MY_FERMI_DIR
+                    my_fermi_dir = os.environ.get('MY_FERMI_DIR', '')
+                    if my_fermi_dir and not catalog_found:
+                        catalog_path = os.path.join(my_fermi_dir, self.catalog)
+                        catalog_paths_checked.append(catalog_path)
+                        if os.path.exists(catalog_path):
+                            catalog_found = True
+                    
+                    # 3. FERMI_DIR
+                    fermi_dir = os.environ.get('FERMI_DIR', '')
+                    if fermi_dir and not catalog_found:
+                        catalog_path = os.path.join(fermi_dir, self.catalog)
+                        catalog_paths_checked.append(catalog_path)
+                        if os.path.exists(catalog_path):
+                            catalog_found = True
+            
+            if not catalog_found:
+                catalog_msg = f"Catalog file: {self.catalog}"
+                if len(catalog_paths_checked) > 1:
+                    catalog_msg += f"\n     Checked: {', '.join(catalog_paths_checked)}"
+                missing_files.append(catalog_msg)
+        
+        # If any files are missing, report them all at once
+        if missing_files:
+            error_msg = "\n\nERROR: The following required files are missing:\n\n"
+            for i, file_info in enumerate(missing_files, 1):
+                error_msg += f"  {i}. {file_info}\n"
+            
+            error_msg += "\nPlease check that:\n"
+            error_msg += "  - All file paths are correct\n"
+            error_msg += "  - Symbolic links are not broken\n"
+            error_msg += "  - Files are accessible from the current directory\n"
+            error_msg += f"  - Current directory: {os.getcwd()}\n"
+            
+            # Add specific help for catalog files
+            if any('Catalog file' in f for f in missing_files):
+                error_msg += "\nFor catalog files, you can:\n"
+                error_msg += "  - Download from: https://fermi.gsfc.nasa.gov/ssc/data/access/lat/\n"
+                error_msg += "  - Place in current directory, or\n"
+                my_fermi = os.environ.get('MY_FERMI_DIR', '')
+                if my_fermi:
+                    error_msg += f"  - Place in MY_FERMI_DIR: {my_fermi}\n"
+                else:
+                    error_msg += "  - Set MY_FERMI_DIR and place catalog there\n"
+            
+            self.logger.error(error_msg)
+            print(error_msg)
+            sys.exit(1)
+        
+        self.logger.info("All required input files validated successfully")
     
     def process_single_source(self, source_name, source_info):
         """
@@ -1122,9 +1269,18 @@ class BexFermi:
             self.logger.info("Step 7: Running gtexposure")
             
             # Handle source name prefix for catalog names starting with numbers
+            # This is needed because FTOOLS doesn't like source names starting with numbers
+            # Pattern: add underscore before catalog identifiers like 4FGL, FL16Y, etc.
             src2 = source_name
-            for prefix in ['1FGL', '2FGL', '3FGL', '4FGL', '18M', '24M', 'FL8Y']:
-                src2 = src2.replace(prefix, f'_{prefix}')
+            
+            # Handle xFGL catalogs (1FGL, 2FGL, 3FGL, 4FGL, 5FGL, etc.)
+            src2 = re.sub(r'(\d+FGL)', r'_\1', src2)
+            
+            # Handle time-period catalogs (18M, 24M, etc.)
+            src2 = re.sub(r'(\d+M)', r'_\1', src2)
+            
+            # Handle FLnY catalogs (FL8Y, FL16Y, FL20Y, etc.)
+            src2 = re.sub(r'(FL\d+Y)', r'_\1', src2)
             
             if self.use_probability:
                 self.run_fermi_tool(
@@ -1180,6 +1336,14 @@ class BexFermi:
                 merge_file = os.path.join(temp_dir, f"{base}.merged_lc")
                 self.stitch_files(old_lc_backup, final_lc, merge_file, base)
                 shutil.move(merge_file, final_lc)
+            
+            # Clean up temporary files
+            # Remove the FITS light curve and fdump output - we only need the final formatted file
+            temp_files_to_remove = [lc_file, lc_dump]
+            for temp_file in temp_files_to_remove:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    self.logger.debug(f"Removed temporary file: {temp_file}")
             
             print(f"\n{'='*60}")
             print(f"SUCCESS! Light curve created: {final_lc}")
@@ -1283,18 +1447,49 @@ class BexFermi:
     
     def _get_fits_keyword(self, filename, keyword):
         """Get a keyword value from a FITS file."""
-        result = subprocess.run(
-            ['fkeypar', f'{filename}[1]', keyword],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to read {keyword} from {filename}")
+        # Try extension 1 first (most common for FITS tables)
+        for ext in ['[1]', '[0]', '']:
+            try:
+                filepath = f'{filename}{ext}'
+                self.logger.debug(f"Trying to read {keyword} from {filepath}")
+                
+                result = subprocess.run(
+                    ['fkeypar', filepath, keyword],
+                    capture_output=True, text=True
+                )
+                
+                if result.returncode != 0:
+                    self.logger.debug(f"fkeypar failed: {result.stderr}")
+                    continue
+                
+                result = subprocess.run(
+                    ['pget', 'fkeypar', 'value'],
+                    capture_output=True, text=True
+                )
+                
+                if result.returncode != 0:
+                    self.logger.debug(f"pget failed: {result.stderr}")
+                    continue
+                
+                value = result.stdout.strip()
+                if value and value != 'INDEF' and value != '':
+                    try:
+                        float_value = float(value)
+                        self.logger.debug(f"Successfully read {keyword} = {float_value} from {filepath}")
+                        return float_value
+                    except ValueError:
+                        self.logger.debug(f"Could not convert '{value}' to float")
+                        continue
+            except Exception as e:
+                self.logger.debug(f"Exception reading {keyword} from {filepath}: {e}")
+                continue
         
-        result = subprocess.run(
-            ['pget', 'fkeypar', 'value'],
-            capture_output=True, text=True
+        # If all attempts failed, raise error with helpful message
+        raise RuntimeError(
+            f"Failed to read {keyword} from {filename}\n"
+            f"Tried extensions: [1], [0], and no extension\n"
+            f"Make sure the file exists and is a valid FITS file"
         )
-        return float(result.stdout.strip())
     
     def _get_update_start_time(self, lc_file):
         """Get the start time for update mode from existing light curve."""
@@ -1446,14 +1641,22 @@ class BexFermi:
     
     def _apply_barycenter(self, lc_file, scfile, ra, dec):
         """Apply barycenter correction to light curve."""
+        # gtbary creates a new file, doesn't modify in place
+        bc_file = lc_file.replace('.fits', '_bary.fits')
+        
         self.run_fermi_tool(
             'gtbary',
+            chatter=2 if not self.batch_mode else 0,
             evfile=lc_file,
+            outfile=bc_file,
             scfile=scfile,
             ra=ra,
             dec=dec,
             tcorrect='BARY'
         )
+        
+        # Replace original file with barycenter-corrected version
+        shutil.move(bc_file, lc_file)
     
     def read_parameter_file(self, filename):
         """
@@ -1473,15 +1676,17 @@ class BexFermi:
                 
                 parts = line.split(None, 1)  # Split on whitespace, max 2 parts
                 
-                if len(parts) == 2:
-                    param, value = parts
-                    param = param.lower()
+                if len(parts) >= 1:
+                    param = parts[0].lower()
+                    value = parts[1] if len(parts) == 2 else ''
                     
                     # Map parameters to attributes
                     if param == 'bin_size':
                         self.bin_size = float(value)
                     elif param == 'roi':
                         self.roi = float(value)
+                    elif param == 'roi_inner':
+                        self.roi_inner = float(value)
                     elif param == 'roi_probability':
                         # This is the default ROI for probability mode
                         pass
@@ -1517,8 +1722,10 @@ class BexFermi:
                         self.use_probability = value.lower() in ('true', '1', 'yes', 'y')
                     elif param == 'barycenter':
                         self.barycenter = value.lower() in ('true', '1', 'yes', 'y')
+                    elif param == 'dodiffuse':
+                        self.dodiffuse = value.lower() in ('true', '1', 'yes', 'y')
                     elif param == 'prefix':
-                        self.prefix = value if len(parts) == 2 else ''
+                        self.prefix = value  # Can be empty string
                     else:
                         self.logger.warning(f"Unknown parameter: {param}")
         
@@ -1550,10 +1757,12 @@ class BexFermi:
             f.write(f"use_probability {self.use_probability}\n")
             if self.use_probability:
                 f.write(f"catalog {self.catalog}\n")
-            f.write(f"pthreshold {self.pthreshold}\n\n")
+            f.write(f"pthreshold {self.pthreshold}\n")
+            f.write(f"dodiffuse {self.dodiffuse}\n\n")
             
             f.write("# Region of interest\n")
             f.write(f"roi {self.roi}\n")
+            f.write(f"roi_inner {getattr(self, 'roi_inner', 0)}\n")
             f.write(f"roi_probability {DEFAULT_ROI_PROBABILITY}\n\n")
             
             f.write("# Selection criteria\n")
