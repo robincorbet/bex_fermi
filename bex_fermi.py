@@ -71,6 +71,7 @@ class BexFermi:
         # Set up parameters
         self.bin_size = self.config.get('bin_size', DEFAULT_BIN_SIZE)
         self.roi = self.config.get('roi', DEFAULT_ROI)
+        self.roi_probability = self.config.get('roi_probability', DEFAULT_ROI_PROBABILITY)
         self.zenith_limit = self.config.get('zenith_limit', DEFAULT_ZENITH_LIMIT)
         self.rock = self.config.get('rock', DEFAULT_ROCK)
         self.bore = self.config.get('bore', DEFAULT_BORE)
@@ -119,140 +120,101 @@ class BexFermi:
         """
         Python implementation of pweight.c functionality.
         
-        Takes a LAT light curve file and the photon file used to create it.
-        Removes COUNTS column from light curve and replaces it with a floating point
-        RCOUNTS column which contains a sum of the probabilities that each photon came
-        from a certain source.
+        Computes probability-weighted counts per light curve bin.
+        Returns the rate array and light curve data for use in output formatting.
+        Does NOT modify the FITS file (avoiding column corruption issues).
         
         Args:
             source_name: Name of the source (column name in photon file)
             light_curve_file: Path to the light curve FITS file
             photon_file: Path to the photon (events) FITS file
             threshold: Probability threshold (default 0.0)
+        
+        Returns:
+            tuple: (rate, lc_time, exposure, timedel) arrays
         """
         self.logger.info(f"Processing probability weights for {source_name}")
         self.logger.info(f"Light curve file: {light_curve_file}")
         self.logger.info(f"Photon file: {photon_file}")
         self.logger.info(f"Probability threshold: {threshold}")
         
-        # Open FITS files
         with fits.open(photon_file) as ph_hdul, \
-             fits.open(light_curve_file, mode='update') as lc_hdul:
+             fits.open(light_curve_file) as lc_hdul:
             
-            # Get photon file data
+            # Get photon data
             ph_data = ph_hdul['EVENTS'].data
             nphotons = len(ph_data)
             self.logger.info(f"Number of photons: {nphotons}")
             
             # Get probability column for this source
             try:
-                probability = ph_data[source_name]
+                probability = ph_data[source_name].astype(np.float64)
             except KeyError:
                 self.logger.error(f"Source {source_name} not found in photon file")
                 raise
             
-            # Get photon times
-            ph_time = ph_data['TIME']
+            ph_time = ph_data['TIME'].astype(np.float64)
             
-            # Get light curve data
-            lc_data = lc_hdul['RATE'].data
+            # Get light curve data - read directly, no modification
+            lc_data   = lc_hdul['RATE'].data
             lc_header = lc_hdul['RATE'].header
-            nlc_bins = len(lc_data)
+            nlc_bins  = len(lc_data)
             
-            # Get light curve parameters
-            tstart = lc_header['TSTART']
-            tstop = lc_header['TSTOP']
+            tstart  = float(lc_header['TSTART'])
+            tstop   = float(lc_header['TSTOP'])
             binsize = (tstop - tstart) / (nlc_bins - 1.0)
-            hbs = binsize / 2.0  # half bin size
+            hbs     = binsize / 2.0
             
-            # Get exposure and time from light curve
-            exposure = lc_data['EXPOSURE']
-            lc_time = lc_data['TIME']
+            # Read columns we need - all by name, not position
+            lc_time  = lc_data['TIME'].astype(np.float64)
+            exposure = lc_data['EXPOSURE'].astype(np.float64)
+            timedel  = lc_data['TIMEDEL'].astype(np.float64)
             
-            # Get GTIs from light curve file
-            gti_data = lc_hdul['GTI'].data
-            gti_start = gti_data['START']
-            gti_stop = gti_data['STOP']
-            ngtis = len(gti_data)
+            # Get GTIs
+            gti_data  = lc_hdul['GTI'].data
+            gti_start = gti_data['START'].astype(np.float64)
+            gti_stop  = gti_data['STOP'].astype(np.float64)
+            ngtis     = len(gti_data)
             
-            # Initialize rate array
-            rate = np.zeros(nlc_bins, dtype=np.float32)
-            total_sum = 0.0
+            # Compute probability-weighted counts per bin
+            rate      = np.zeros(nlc_bins, dtype=np.float64)
             
-            # Vectorized approach for much better performance
             self.logger.info(f"Processing {nphotons} photons with vectorized algorithm...")
             
-            # Filter photons by threshold first (if applicable)
-            if threshold > 0:
-                valid_mask = probability > threshold
-                valid_probs = probability[valid_mask]
-                valid_times = ph_time[valid_mask]
-                self.logger.info(f"After threshold filter: {len(valid_probs)} photons")
-            else:
-                valid_probs = probability
-                valid_times = ph_time
+            # Step 1: Compute bin boundaries from actual lc_time values
+            bin_lower = lc_time - hbs
+            bin_upper = lc_time + hbs
             
-            # For each photon, find its time bin
-            # Vectorized calculation of approximate bin numbers
-            approx_bins = np.floor((valid_times - tstart) / binsize).astype(int) - 10
-            approx_bins = np.maximum(approx_bins, 0)
+            if not np.all(np.diff(bin_lower) > 0):
+                self.logger.warning("Bin lower boundaries are not monotonically increasing")
             
-            # Check GTIs - vectorized
-            in_gti = np.zeros(len(valid_times), dtype=bool)
+            # Step 2: Find bin index for each photon using searchsorted
+            exact_bins = np.searchsorted(bin_lower, ph_time, side='right') - 1
+            exact_bins = np.clip(exact_bins, 0, nlc_bins - 1)
+            
+            # Step 3: Verify photon falls within its assigned bin
+            valid_bin = ((ph_time >= bin_lower[exact_bins]) &
+                         (ph_time <= bin_upper[exact_bins]))
+            
+            # Step 4: Check GTIs
+            in_gti = np.zeros(nphotons, dtype=bool)
             for i in range(ngtis):
-                in_gti |= (valid_times >= gti_start[i]) & (valid_times <= gti_stop[i])
+                in_gti |= ((ph_time >= gti_start[i]) &
+                            (ph_time <= gti_stop[i]))
             
-            valid_probs = valid_probs[in_gti]
-            valid_times = valid_times[in_gti]
-            approx_bins = approx_bins[in_gti]
+            # Step 5: Apply probability threshold
+            above_threshold = probability > threshold
             
-            self.logger.info(f"After GTI filter: {len(valid_probs)} photons")
+            # Step 6: Accumulate valid photon probabilities into bins
+            valid = valid_bin & in_gti & above_threshold
+            self.logger.info(f"Photons passing all cuts: {np.sum(valid)}")
+            np.add.at(rate, exact_bins[valid], probability[valid])
             
-            # Now find exact bins for each photon
-            # This is still a loop but much smaller dataset after filtering
-            for i in range(len(valid_times)):
-                # Start search from approximate bin
-                for j in range(approx_bins[i], nlc_bins):
-                    if (lc_time[j] - hbs) <= valid_times[i] <= (lc_time[j] + hbs):
-                        rate[j] += valid_probs[i]
-                        total_sum += valid_probs[i]
-                        break
-            
+            total_sum = float(np.sum(rate))
             self.logger.info(f"Probability sum: {total_sum}")
-            
-            # Delete existing COUNTS column and add RCOUNTS
-            # Find the COUNTS column number
-            cols = lc_hdul['RATE'].columns
-            count_idx = None
-            for idx, col in enumerate(cols):
-                if col.name == 'COUNTS':
-                    count_idx = idx
-                    break
-            
-            if count_idx is not None:
-                # Create new column definition
-                new_cols = []
-                for idx, col in enumerate(cols):
-                    if idx == count_idx:
-                        # Replace COUNTS with RCOUNTS
-                        new_col = fits.Column(name='RCOUNTS', format='E', 
-                                            array=rate)
-                        new_cols.append(new_col)
-                    else:
-                        new_cols.append(col)
-                
-                # Create new table HDU with updated columns
-                new_hdu = fits.BinTableHDU.from_columns(new_cols, 
-                                                        header=lc_header,
-                                                        name='RATE')
-                
-                # Replace the RATE extension
-                lc_hdul['RATE'] = new_hdu
-                
-                # Write changes
-                lc_hdul.flush()
-                
-            self.logger.info("Successfully updated light curve with probability weights")
+            self.logger.debug(f"Non-zero bins: {np.sum(rate > 0)} of {nlc_bins}")
+        
+        return rate, lc_time, exposure, timedel
     
     @staticmethod
     def _check_gti(gti_start, gti_stop, time, ngtis):
@@ -778,7 +740,7 @@ class BexFermi:
             print("This will only work for cataloged sources.")
             print("Automatic XML file generation will be done unless overridden by source file contents")
             print("(Increasing default ROI))\n")
-            self.roi = DEFAULT_ROI_PROBABILITY
+            self.roi = self.roi_probability
             
             self.catalog = self.get_string(
                 "Give source catalog file name",
@@ -1111,8 +1073,7 @@ class BexFermi:
             temp3 = os.path.join(temp_dir, f"{base}.temp3.fits")
             eventfile2 = os.path.join(temp_dir, f"{base}.eventfile2.fits")
             lc_file = f"lc_{base}.fits"
-            lc_dump = f"lc_{base}.dmp1"
-            final_lc = f"lc_{base}dmp1.out"
+            final_lc = f"lc_{base}.dmp1.out"
             
             # Determine IRF settings based on irf_code
             irfs, event_class, event_type = self._get_irf_settings()
@@ -1174,6 +1135,7 @@ class BexFermi:
             tstop = min(self.stop_time, tstop)
             
             # Check for update mode
+            old_lc_backup = None  # Initialize to avoid reference errors
             if self.update_mode and Path(final_lc).exists():
                 self.logger.info("Update mode: getting start time from existing file")
                 tstart = self._get_update_start_time(final_lc)
@@ -1265,8 +1227,27 @@ class BexFermi:
                 dtime=self.bin_size
             )
             
-            # Step 7: gtexposure
-            self.logger.info("Step 7: Running gtexposure")
+            # Step 5b: Verify source name in model file matches what we'll pass to gtexposure
+            if self.use_probability and os.path.exists(model_file):
+                import xml.etree.ElementTree as ET
+                try:
+                    tree = ET.parse(model_file)
+                    source_names = [s.get('name') for s in tree.findall('.//source')]
+                    self.logger.info(f"Sources in model file: {source_names[:5]}...")
+                    expected_src2 = source_name
+                    expected_src2 = re.sub(r'(\d+FGL)', r'_\1', expected_src2)
+                    expected_src2 = re.sub(r'(\d+M)', r'_\1', expected_src2)
+                    expected_src2 = re.sub(r'(FL\d+Y)', r'_\1', expected_src2)
+                    if expected_src2 not in source_names:
+                        self.logger.warning(
+                            f"Target '{expected_src2}' NOT found in model file! "
+                            f"gtexposure may use wrong spectral shape. "
+                            f"Available source names: {source_names}"
+                        )
+                    else:
+                        self.logger.info(f"Target '{expected_src2}' found in model file OK")
+                except Exception as e:
+                    self.logger.warning(f"Could not parse model file for diagnostic: {e}")
             
             # Handle source name prefix for catalog names starting with numbers
             # This is needed because FTOOLS doesn't like source names starting with numbers
@@ -1303,47 +1284,106 @@ class BexFermi:
                     specin=self.spectral_index
                 )
             
+            # Diagnostic: log exposure values from FITS file right after gtexposure
+            # Compare these with the Perl version to identify where the discrepancy is
+            with fits.open(lc_file) as _diag:
+                _exp = _diag['RATE'].data['EXPOSURE']
+                _nonzero = _exp[_exp > 0]
+                if len(_nonzero) > 0:
+                    self.logger.info(
+                        f"Exposure diagnostic (first 3 non-zero bins after gtexposure): "
+                        f"{_nonzero[:3]}"
+                    )
+                    self.logger.info(
+                        f"Exposure diagnostic: mean={np.mean(_nonzero):.4e}, "
+                        f"min={np.min(_nonzero):.4e}, max={np.max(_nonzero):.4e}"
+                    )
+                    self.logger.info(
+                        f"src2 (target name passed to gtexposure): {src2}"
+                    )
+            
             # Step 8: pweight - apply probability weighting
+            # pweight returns arrays directly, avoiding any FITS file corruption
             if self.use_probability:
                 self.logger.info("Step 8: Applying probability weighting")
-                self.pweight(src2, lc_file, eventfile2, self.pthreshold)
+                pw_counts, lc_time, lc_exposure, lc_timedel = self.pweight(
+                    src2, lc_file, eventfile2, self.pthreshold
+                )
+            else:
+                # Read directly from FITS for non-probability mode
+                with fits.open(lc_file) as lc_hdul:
+                    lc_data    = lc_hdul['RATE'].data
+                    pw_counts  = lc_data['COUNTS'].astype(np.float64)
+                    lc_time    = lc_data['TIME'].astype(np.float64)
+                    lc_exposure= lc_data['EXPOSURE'].astype(np.float64)
+                    lc_timedel = lc_data['TIMEDEL'].astype(np.float64)
             
             # Step 9: Barycenter correction
+            # Apply to lc_time array directly (avoids gtbary corrupting FITS columns)
             if self.barycenter:
                 self.logger.info("Step 9: Applying barycenter correction")
-                self._apply_barycenter(lc_file, self.ft2, ra, dec)
+                lc_time = self._apply_barycenter_to_times(
+                    lc_time, lc_file, self.ft2, ra, dec
+                )
             
-            # Step 10: fdump - extract to text
-            self.logger.info("Step 10: Running fdump")
-            counts_col = 'RCOUNTS' if self.use_probability else 'COUNTS'
-            self.run_fermi_tool(
-                'fdump',
-                prhead='no',
-                infile=f'{lc_file}[1]',
-                outfile=lc_dump,
-                columns=f'TIME {counts_col} EXPOSURE TIMEDEL',
-                pagewidth=256,
-                rows='-'
-            )
+            # Step 10/11: Format output using arrays directly
+            self.logger.info("Step 10: Formatting light curve")
             
-            # Step 11: prepare_light_curve - format output
-            self.logger.info("Step 11: Formatting light curve")
-            self.prepare_light_curve(lc_dump, final_lc, base)
+            times    = lc_time
+            counts   = pw_counts
+            exposure = lc_exposure
+            timedel  = lc_timedel
             
-            # Step 12: Handle update mode
-            if self.update_mode and Path(old_lc_backup).exists():
+            # Calculate mean count rate (first pass)
+            mask = exposure > 0
+            countsum = float(np.sum(counts[mask]))
+            expsum   = float(np.sum(exposure[mask]))
+            meanrate = countsum / expsum if expsum > 0 else 0.0
+            self.logger.info(f"Mean count rate: {meanrate:.6e}")
+            self.logger.info(f"Total counts: {countsum:.4f}, Total exposure: {expsum:.4e}")
+            
+            def write_lc_file(out_file):
+                """Write formatted light curve to output file."""
+                with open(out_file, 'w') as f:
+                    f.write(f"{base}\n")
+                    f.write("Time (MJD)\n")
+                    f.write("Rate (ph/cm^2/s)\n")
+                    for i in range(len(times)):
+                        if exposure[i] > 0:
+                            # Exposure-based error
+                            popcounts = meanrate * exposure[i]
+                            perr  = np.sqrt(popcounts)
+                            prerr = perr / exposure[i]
+                            # BaBar count-rate error
+                            cerr1 = 0.5 + np.sqrt(counts[i] + 0.25)
+                            cerr2 = -0.5 + np.sqrt(counts[i] + 0.25)
+                            rmserr = np.sqrt((cerr1**2 + cerr2**2) / 2.0)
+                            rate  = counts[i] / exposure[i]
+                            rerr  = rmserr / exposure[i]
+                            # Convert time and timedel
+                            time_mjd     = (times[i] / 86400.0) + MJDREF
+                            timedel_days = timedel[i] / (2.0 * 86400.0)
+                            f.write(f"{time_mjd:.10f} {rate:.10e} {rerr:.10e} "
+                                   f"{timedel_days:.10f} {prerr:.10e} {exposure[i]:.10e}\n")
+            
+            # In update mode, write to a temporary file first, then merge
+            if self.update_mode and old_lc_backup and Path(old_lc_backup).exists():
+                new_lc_temp = os.path.join(temp_dir, f"{base}.new_lc")
+                write_lc_file(new_lc_temp)
+                
+                # Step 12: Merge with old light curve
                 self.logger.info("Step 12: Merging with old light curve")
                 merge_file = os.path.join(temp_dir, f"{base}.merged_lc")
-                self.stitch_files(old_lc_backup, final_lc, merge_file, base)
+                self.stitch_files(old_lc_backup, new_lc_temp, merge_file, base)
                 shutil.move(merge_file, final_lc)
+            else:
+                # Normal mode - write directly to final output
+                write_lc_file(final_lc)
             
-            # Clean up temporary files
-            # Remove the FITS light curve and fdump output - we only need the final formatted file
-            temp_files_to_remove = [lc_file, lc_dump]
-            for temp_file in temp_files_to_remove:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                    self.logger.debug(f"Removed temporary file: {temp_file}")
+            # Clean up the FITS light curve - we only need the final formatted file
+            if os.path.exists(lc_file):
+                os.remove(lc_file)
+                self.logger.debug(f"Removed temporary file: {lc_file}")
             
             print(f"\n{'='*60}")
             print(f"SUCCESS! Light curve created: {final_lc}")
@@ -1639,24 +1679,34 @@ class BexFermi:
                 else:
                     os.unlink(py_script.name)
     
-    def _apply_barycenter(self, lc_file, scfile, ra, dec):
-        """Apply barycenter correction to light curve."""
-        # gtbary creates a new file, doesn't modify in place
+    def _apply_barycenter_to_times(self, lc_time, lc_file, scfile, ra, dec):
+        """
+        Apply barycenter correction and return corrected TIME array.
+        
+        Runs gtbary on the light curve to get corrected times, reads ONLY
+        the TIME column from the result, then discards the temp file.
+        This avoids any risk of gtbary corrupting EXPOSURE or other columns.
+        """
         bc_file = lc_file.replace('.fits', '_bary.fits')
-        
-        self.run_fermi_tool(
-            'gtbary',
-            chatter=2 if not self.batch_mode else 0,
-            evfile=lc_file,
-            outfile=bc_file,
-            scfile=scfile,
-            ra=ra,
-            dec=dec,
-            tcorrect='BARY'
-        )
-        
-        # Replace original file with barycenter-corrected version
-        shutil.move(bc_file, lc_file)
+        try:
+            self.run_fermi_tool(
+                'gtbary',
+                chatter=2 if not self.batch_mode else 0,
+                evfile=lc_file,
+                outfile=bc_file,
+                scfile=scfile,
+                ra=ra,
+                dec=dec,
+                tcorrect='BARY'
+            )
+            # Read ONLY the corrected TIME values
+            with fits.open(bc_file) as bc_hdul:
+                corrected_times = bc_hdul['RATE'].data['TIME'].astype(np.float64)
+            self.logger.info("Barycenter correction applied to TIME values")
+            return corrected_times
+        finally:
+            if os.path.exists(bc_file):
+                os.remove(bc_file)
     
     def read_parameter_file(self, filename):
         """
@@ -1688,8 +1738,7 @@ class BexFermi:
                     elif param == 'roi_inner':
                         self.roi_inner = float(value)
                     elif param == 'roi_probability':
-                        # This is the default ROI for probability mode
-                        pass
+                        self.roi_probability = float(value)
                     elif param == 'zenith_limit':
                         self.zenith_limit = float(value)
                     elif param == 'rock':
@@ -1730,6 +1779,19 @@ class BexFermi:
                         self.logger.warning(f"Unknown parameter: {param}")
         
         self.logger.info("Parameters loaded from file")
+        
+        # Replicate Perl script's behavior: whenever probability photometry is
+        # enabled, the aperture radius is ALWAYS taken from roi_probability,
+        # overriding any explicit 'roi' value in the parameter file.
+        # This matches Perl's get_value() semantics, where even in batch mode
+        # the surrounding logic (which does this override) still executes -
+        # only the interactive prompt itself is skipped.
+        if self.use_probability:
+            self.logger.info(
+                f"Probability photometry enabled: overriding roi "
+                f"({self.roi}) with roi_probability ({self.roi_probability})"
+            )
+            self.roi = self.roi_probability
     
     def write_parameter_file(self, filename):
         """
@@ -1763,7 +1825,7 @@ class BexFermi:
             f.write("# Region of interest\n")
             f.write(f"roi {self.roi}\n")
             f.write(f"roi_inner {getattr(self, 'roi_inner', 0)}\n")
-            f.write(f"roi_probability {DEFAULT_ROI_PROBABILITY}\n\n")
+            f.write(f"roi_probability {self.roi_probability}\n\n")
             
             f.write("# Selection criteria\n")
             f.write(f"zenith_limit {self.zenith_limit}\n")
